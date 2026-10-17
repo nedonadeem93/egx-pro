@@ -3,6 +3,8 @@
 عميل ESTHMR MCP — بيانات البورصة المصرية الرسمية (esthmr.com)
 ==============================================================
 - توكن OAuth مع تجديد تلقائي بـ refresh_token (مش محتاج تسجيل تاني)
+- قفل (Lock) يمنع سباق التجديد المتوازي — أكثر سبب بيأدي لإلغاء الجرانت
+- مصمةخ أمان: لو الخادم رفض التجديد (invalid_grant) بنوقف المحاولات 10 دقايق
 - كاش يومي: نفس الطلب في نفس يوم تداول = مجاني (بلاش من الرصيد)
 - عدادات استخدام تحترم حدود الموقع: 300 طلب/يوم + 40 شركة مختلفة/يوم
 - كل الاستدعاءات بترجع نص جاهز للعرض أو dict مفكوك بالـ parsers
@@ -20,6 +22,7 @@
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -54,6 +57,14 @@ UNIT = {"m": 1e6, "bn": 1e9, "trillion": 1e12}
 # ---------------- st.secrets / بيئة (Streamlit Cloud) ----------------
 
 _MEM_TOKEN = {}
+
+# حماية ضد سباق التجديد وضرب الخادم بمحاولات فاشلة متكررة:
+# جلسات Streamlit بتشتغل في threads متوازية — من غير قفل، اتنين منهم
+# ممكن يجددوا بنفس refresh_token في نفس اللحظة، والخادم بيعدّ ده
+# "إعادة استخدام توكن مدوّر" فيلغي الجرانت كله (invalid_grant).
+_REFRESH_LOCK = threading.Lock()
+_AUTH_DEAD_UNTIL = 0.0   # وقت تعطيل محاولات التجديد بعد رفض الخادم
+_AUTH_BACKOFF = 600      # 10 دقايق حماية
 
 
 def _secrets():
@@ -126,42 +137,62 @@ def load_token():
     return tok
 
 
-def refresh_token():
-    """يحدّث access_token بـ refresh_token — ويرجّع التوكن الجديد."""
-    global _MEM_TOKEN
-    tok = load_token()
-    sec = _secrets()
-    creds = _load(CREDS_FILE, {}) or {}
-    client_id = (sec.get("client_id") or creds.get("client_id")
-                 or tok.get("client_id"))
-    rt = tok.get("refresh_token")
-    if not rt or not client_id:
-        raise EsthmrError("مفيش refresh_token أو client_id — لازم إعادة ربط الحساب")
-    data = urllib.parse.urlencode({
-        "grant_type": "refresh_token",
-        "refresh_token": rt,
-        "client_id": client_id,
-        "resource": RESOURCE,
-    }).encode()
-    req = urllib.request.Request(
-        TOKEN_URL, data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded",
-                 "Accept": "application/json", "User-Agent": UA})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            new = json.load(r)
-    except urllib.error.HTTPError as e:
-        raise EsthmrError(f"فشل تجديد التوكن (HTTP {e.code}): {e.read().decode()[:200]}")
-    except Exception as e:
-        raise EsthmrError(f"فشل تجديد التوكن: {e}")
-    if "access_token" not in new:
-        raise EsthmrError(f"رد تجديد غير متوقع: {str(new)[:200]}")
-    new["_expires_at"] = time.time() + int(new.get("expires_in", 3600))
-    if "refresh_token" not in new:
-        new["refresh_token"] = rt
-    _MEM_TOKEN = new          # في الذاكرة فوراً (حتى لو القرص مش قابل للكتابة)
-    _save(TOKEN_FILE, new)    # حفظ محلي best-effort (على Cloud بيضيع مع إعادة التشغيل — عادي)
-    return new
+def refresh_token(force=False):
+    """يحدّث access_token بـ refresh_token — ويرجّع التوكن الجديد.
+    - force=True: جدّد حتى لو التوكن المحلي شكله سليم (بعد 401 من الخادم).
+    - القفل بيضمن إن refresh واحد بس ي شغل في نفس اللحظة مهما كانت عدد الجلسات.
+    - لو الخادم رد invalid_grant بنوقف كل المحاولات 10 دقايق (حماية الحساب)."""
+    global _MEM_TOKEN, _AUTH_DEAD_UNTIL
+    if time.time() < _AUTH_DEAD_UNTIL:
+        raise EsthmrError(
+            "esthmr: الربط ملغي من الخادم (invalid_grant) — محاولات التجديد "
+            "متوقفة مؤقتاً كحماية للحساب. محتاج إعادة ربط من جديد.")
+    with _REFRESH_LOCK:
+        tok = load_token()
+        if not force and tok.get("access_token") and not _expired(tok):
+            return tok  # thread تاني جدّد للتو — مفيش داعي نلمس الخادم
+        sec = _secrets()
+        creds = _load(CREDS_FILE, {}) or {}
+        client_id = (sec.get("client_id") or creds.get("client_id")
+                     or tok.get("client_id"))
+        rt = tok.get("refresh_token")
+        if not rt or not client_id:
+            raise EsthmrError("مفيش refresh_token أو client_id — لازم إعادة ربط الحساب")
+        data = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": rt,
+            "client_id": client_id,
+            "resource": RESOURCE,
+        }).encode()
+        req = urllib.request.Request(
+            TOKEN_URL, data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "Accept": "application/json", "User-Agent": UA})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                new = json.load(r)
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode()[:200]
+            except Exception:
+                pass
+            if "invalid_grant" in body:
+                _AUTH_DEAD_UNTIL = time.time() + _AUTH_BACKOFF
+                raise EsthmrError(
+                    "الربط مع esthmr ملغي من الخادم (invalid_grant) — "
+                    "لازم إعادة ربط من جديد. إيقاف محاولات التجديد 10 دقايق.")
+            raise EsthmrError(f"فشل تجديد التوكن (HTTP {e.code}): {body}")
+        except Exception as e:
+            raise EsthmrError(f"فشل تجديد التوكن: {e}")
+        if "access_token" not in new:
+            raise EsthmrError(f"رد تجديد غير متوقع: {str(new)[:200]}")
+        new["_expires_at"] = time.time() + int(new.get("expires_in", 3600))
+        if "refresh_token" not in new:
+            new["refresh_token"] = rt
+        _MEM_TOKEN = new          # في الذاكرة فوراً (حتى لو القرص مش قابل للكتابة)
+        _save(TOKEN_FILE, new)    # حفظ محلي best-effort (على Cloud بيضيع مع إعادة التشغيل — عادي)
+        return new
 
 
 def _expired(tok, margin=180):
@@ -286,7 +317,7 @@ def call_tool(name, args=None, company=None, use_cache=True, timeout=60):
         raw = _post(payload, timeout)
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            refresh_token()
+            refresh_token(force=True)   # القفل والفترة الاحتياطية جواها
             raw = _post(payload, timeout)
         else:
             raise EsthmrError(f"MCP HTTP {e.code}: {e.read().decode()[:200]}")
