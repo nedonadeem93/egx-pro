@@ -144,8 +144,7 @@ def get_data_yf(symbol):
     df = yf.download(f"{symbol}.CA", period="1y", interval="1d",
                      progress=False, auto_adjust=True)
     df = flat_cols(df).dropna()
-    for c in ["Open", "High", "Low", "Close"]:
-        df[c] = df[c] * 1000
+    # Yahoo بيرجّع أسعار EGX بالجنيه صح — مفيش أي تحويل (الشومع متأكدة من esthmr)
     return df
 
 def get_hist(symbol):
@@ -231,7 +230,7 @@ def fresh_yf(symbol, last_d):
             if CAIRO:
                 ts = ts.tz_convert(CAIRO)
             if ts.date() >= last_d:
-                return float(t["Close"].iloc[-1]) * 1000, ts
+                return float(t["Close"].iloc[-1]), ts
         except Exception:
             continue
     return None, None
