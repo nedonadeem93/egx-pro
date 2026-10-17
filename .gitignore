@@ -1,0 +1,14 @@
+# 🔐 Secrets - NEVER upload these to GitHub
+esthmr_token.json
+esthmr_creds.json
+esthmr_usage.json
+esthmr_cache.json
+.streamlit/secrets.toml
+
+# Local personal files
+watchlist.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
