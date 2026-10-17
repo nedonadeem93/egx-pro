@@ -495,4 +495,37 @@ def parse_screen(text):
         if not m:
             continue
         sym, desc, tail = m.group(1), m.group(2).strip(), m.group(3)
-        row = {"sym": sym, "desc": desc, "traded_value": 0.0, "market_cap":
+        row = {"sym": sym, "desc": desc, "traded_value": 0.0, "market_cap": None}
+        tm = (re.search(r"value traded EGP ([\d.]+)\s*(m|bn|trillion)", tail)
+              or re.search(r"traded value EGP ([\d.]+)\s*(m|bn|trillion)", tail))
+        if tm:
+            row["traded_value"] = float(tm.group(1)) * UNIT[tm.group(2)]
+        mm = re.search(r"market value EGP ([\d.]+)\s*(m|bn|trillion)", tail)
+        if mm:
+            row["market_cap"] = float(mm.group(1)) * UNIT[mm.group(2)]
+        rows.append(row)
+    return rows, total
+
+
+def insider_signal(est):
+    """يحوّل أرقام المطلعين لإشارة درج (+1/+2/-1) وسبب نصي."""
+    if not est:
+        return 0, None
+    buys = est.get("ins90_buys")
+    sells = est.get("ins90_sells")
+    net = est.get("ins90_net")
+    if buys is None or net is None:
+        return 0, None
+    if net > 0 and buys >= 5:
+        return 2, (f"✅ المطلعين مشترون صافي ({buys} شراء) — "
+                   f"+{net:,} سهم في 90 يوم")
+    if net > 0 and buys >= 2:
+        return 1, (f"✅ المطلعين مشترون صافي ({buys} شراء / {sells} بيع) — "
+                   f"+{net:,} سهم في 90 يوم")
+    if net < 0 and sells >= 10:
+        return -1, (f"⚠️ المطلعين بائعون صافي ({sells} بيع / {buys} شراء) — "
+                    f"{net:,} سهم في 90 يوم")
+    if net < 0 and sells >= 3:
+        return 0, (f"ℹ️ ميل بيع خفيف من المطلعين ({sells} بيع / {buys} شراء) — "
+                   f"{net:,} سهم في 90 يوم")
+    return 0, (f"ℹ️ نشاط مطلعين هادي ({buys} شراء / {sells} بيع) في 90 يوم")
